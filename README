@@ -1,0 +1,342 @@
+# 1) Motivation
+
+PostgreSQL NUMERIC data type is almost equivalent to Oracle NUMBER data type.
+For example, NUMBER(21,8) can be represented in PostgreSQL as NUMERIC(21,8).
+
+While both RDBMS store these data types in a similar way, when fetching the
+value from the database, PostgreSQL will always print it with N digits after
+the decimal separator (being N the precision, in our example it is 8),
+regardless of the value of these digits. For example:
+
+
+william=# select '1.000001000000000' as input,
+william-#        1.000001000000000::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1.0000100' as input,
+william-#        1.0000100::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1.0000' as input,
+william-#        1.0000::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1' as input,
+william-#        1::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1234567890123' as input,
+william-#        1234567890123::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1234567890123.12345678' as input,
+william-#        1234567890123.12345678::numeric(21,8) as "numeric(21,8)"
+william-# union all
+william-# select '1.00001' as input,
+william-#        1.00001::numeric(21,8) as "numeric(21,8)";
+         input          |     numeric(21,8)
+------------------------+------------------------
+ 1.000001000000000      |             1.00000100
+ 1.0000100              |             1.00001000
+ 1.0000                 |             1.00000000
+ 1                      |             1.00000000
+ 1234567890123          | 1234567890123.00000000
+ 1234567890123.12345678 | 1234567890123.12345678
+ 1.00001                |             1.00001000
+(7 rows)
+
+
+When printing the value, Oracle remove trailing zeroes, keeping only the most
+representative part of the number. Oracle can even remove the decimal separator
+and print the number as if it was an INTEGER data type, if there are only zeroes
+after the decimal separator. For example:
+
+
+        input          |  Oracle number(21,8)
+------------------------+------------------------
+1.000001000000000      | 1.000001
+1.0000100              | 1.00001
+1.0000                 | 1
+1                      | 1
+1234567890123          | 1234567890123
+1234567890123.12345678 | 1234567890123.12345678
+1.00001                | 1.00001
+
+
+# 2) Using rtrim(to_char())
+
+A simple way to simulate Oracle NUMBER behavior is to convert all PostgreSQL
+NUMERIC values to text and then apply some character handling functions on it,
+for example:
+
+
+william=# select '1.000001000000000' as input,
+william-#        rtrim(to_char(1.000001000000000, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1.0000100' as input,
+william-#        rtrim(to_char(1.0000100, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1.0000' as input,
+william-#        rtrim(to_char(1.0000, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1' as input,
+william-#        rtrim(to_char(1, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1234567890123' as input,
+william-#        rtrim(to_char(1234567890123, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1234567890123.12345678' as input,
+william-#        rtrim(to_char(1234567890123.12345678, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')"
+william-# union all
+william-# select '1.00001' as input,
+william-#        rtrim(to_char(1.00001, 'FM9999999999999D99999999'), '.') as "rtrim(to_char(input, 'FM9999999999999D99999999'), '.')";
+         input          | rtrim(to_char(input, 'FM9999999999999D99999999'), '.')
+------------------------+--------------------------------------------------------
+ 1.000001000000000      | 1.000001
+ 1.0000100              | 1.00001
+ 1.0000                 | 1
+ 1                      | 1
+ 1234567890123          | 1234567890123
+ 1234567890123.12345678 | 1234567890123.12345678
+ 1.00001                | 1.00001
+(7 rows)
+
+
+'rtrim(to_char(' approach is easy to implement, but it has 2 main cons:
+
+- It imposes a performance penalty when retrieving every numeric field, because
+it has to convert to string on a specific format, and then apply a 'rtrim';
+- You have to change every SELECT query that retrieves numeric fields.
+
+
+# 3) The pg_numbertype PostgreSQL extension
+
+We implemented a PostgreSQL extension called pg_numbertype, which provides a new
+data type called NUMBER, very similar to the Oracle NUMBER data type. This new
+PostgreSQL NUMBER data type is based on the built-in PostgreSQL NUMERIC data
+type and stores information, allows casts and operators in the exact same way.
+The performance of the NUMBER data type we implemented is also very similar to
+the NUMERIC data type.
+
+The only difference is when displaying information. The new PostgreSQL NUMBER
+data type was implemented to mirror Oracle NUMBER trailing zero output format:
+
+
+william=# select '1.000001000000000' as input,
+william-#        1.000001000000000::numeric(21,8) as "numeric(21,8)",
+william-#        1.000001000000000::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1.0000100' as input,
+william-#        1.0000100::numeric(21,8) as "numeric(21,8)",
+william-#        1.0000100::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1.0000' as input,
+william-#        1.0000::numeric(21,8) as "numeric(21,8)",
+william-#        1.0000::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1' as input,
+william-#        1::numeric(21,8) as "numeric(21,8)",
+william-#        1::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1234567890123' as input,
+william-#        1234567890123::numeric(21,8) as "numeric(21,8)",
+william-#        1234567890123::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1234567890123.12345678' as input,
+william-#        1234567890123.12345678::numeric(21,8) as "numeric(21,8)",
+william-#        1234567890123.12345678::number(21,8) as "number(21,8)"
+william-# union all
+william-# select '1.00001' as input,
+william-#        1.00001::numeric(21,8) as "numeric(21,8)",
+william-#        1.00001::number(21,8) as "number(21,8)";
+         input          |     numeric(21,8)      |      number(21,8)
+------------------------+------------------------+------------------------
+ 1.000001000000000      |             1.00000100 | 1.000001
+ 1.0000100              |             1.00001000 | 1.00001
+ 1.0000                 |             1.00000000 | 1
+ 1                      |             1.00000000 | 1
+ 1234567890123          | 1234567890123.00000000 | 1234567890123
+ 1234567890123.12345678 | 1234567890123.12345678 | 1234567890123.12345678
+ 1.00001                |             1.00001000 | 1.00001
+(7 rows)
+
+
+It also can be used as a data field inside a table. Also note that it supports
+implicit casting, so when inserting data you don't need to explicitly cast the
+values:
+
+
+william=# create table test_number(x number(21,8));
+CREATE TABLE
+william=#
+william=# insert into test_number values (1.0000100);
+INSERT 0 1
+william=# insert into test_number values (1.0000);
+INSERT 0 1
+william=# insert into test_number values (1);
+INSERT 0 1
+william=# insert into test_number values (1234567890123);
+INSERT 0 1
+william=# insert into test_number values (1234567890123.12345678);
+INSERT 0 1
+william=# insert into test_number values (1.00001);
+INSERT 0 1
+william=#
+william=# select * from test_number;
+          x
+------------------------
+1.00001
+1
+1
+1234567890123
+1234567890123.12345678
+1.00001
+(6 rows)
+
+
+It can also be used as function argument or return data types, can be used
+inside other composite data types, etc. Everywhere the NUMERIC data type can be
+used, the NUMBER data type can be used too, with no performance penalties.
+
+
+# 4) Notes about developing with NUMBER data type
+
+Depending on the language you are developing, NUMBER data type may be handled as
+a numeric data type (double, float or Decimal, for example), or it can be
+handled as a string.
+
+Please check the example below. It is Python, I am using the Spartacus database
+wrapper which, for PostgreSQL connections, use the psycopg2 driver underneath.
+
+
+>>> from Spartacus.Database import PostgreSQL
+>>> d = PostgreSQL('127.0.0.1', 5432, 'william', 'william', '')
+>>> t = d.Query('''select '1.000001000000000' as input,
+...        1.000001000000000::numeric(21,8) as "numeric(21,8)",
+...        1.000001000000000::number(21,8) as "number(21,8)"
+... union all
+... select '1.0000100' as input,
+...        1.0000100::numeric(21,8) as "numeric(21,8)",
+...        1.0000100::number(21,8) as "number(21,8)"
+... union all
+... select '1.0000' as input,
+...        1.0000::numeric(21,8) as "numeric(21,8)",
+...        1.0000::number(21,8) as "number(21,8)"
+... union all
+... select '1' as input,
+...        1::numeric(21,8) as "numeric(21,8)",
+...        1::number(21,8) as "number(21,8)"
+... union all
+... select '1234567890123' as input,
+...        1234567890123::numeric(21,8) as "numeric(21,8)",
+...        1234567890123::number(21,8) as "number(21,8)"
+... union all
+... select '1234567890123.12345678' as input,
+...        1234567890123.12345678::numeric(21,8) as "numeric(21,8)",
+...        1234567890123.12345678::number(21,8) as "number(21,8)"
+... union all
+... select '1.00001' as input,
+...        1.00001::numeric(21,8) as "numeric(21,8)",
+...        1.00001::number(21,8) as "number(21,8)"''')
+>>> print(t.Pretty())
++------------------------+------------------------+------------------------+
+| input                  | numeric(21,8)          | number(21,8)           |
++------------------------+------------------------+------------------------+
+| 1.000001000000000      | 1.00000100             | 1.000001               |
+| 1.0000100              | 1.00001000             | 1.00001                |
+| 1.0000                 | 1.00000000             | 1                      |
+| 1                      | 1.00000000             | 1                      |
+| 1234567890123          | 1234567890123.00000000 | 1234567890123          |
+| 1234567890123.12345678 | 1234567890123.12345678 | 1234567890123.12345678 |
+| 1.00001                | 1.00001000             | 1.00001                |
++------------------------+------------------------+------------------------+
+>>> t.Rows[0]['numeric(21,8)']
+Decimal('1.00000100')
+>>> t.Rows[0]['number(21,8)']
+'1.000001'
+
+
+Note how NUMERIC was handled as Decimal, and NUMBER was handled as string. It
+happens because psycopg2 has a default map to convert from PostgreSQL to Python
+data types, and as NUMBER is not included in this list, the default is to
+convert it as string.
+
+However, psycopg2 offers an API to include a data type mapping. The complete
+example is as follows:
+
+
+>>> from Spartacus.Database import PostgreSQL
+>>> import psycopg2.extensions
+>>> import decimal
+>>> def cast_number(value, cur):
+...     if value is None:
+...             return None
+...     else:
+...             return decimal.Decimal(value)
+...
+>>> d = PostgreSQL('127.0.0.1', 5432, 'william', 'william', '')
+>>> d.ExecuteScalar("select oid from pg_type where typname = 'number'")
+20390
+>>> psycopg2.extensions.register_type(psycopg2.extensions.new_type((20390,), 'NUMBER', cast_number))
+>>> t = d.Query('''select '1.000001000000000' as input,
+...        1.000001000000000::numeric(21,8) as "numeric(21,8)",
+...        1.000001000000000::number(21,8) as "number(21,8)"
+... union all
+... select '1.0000100' as input,
+...        1.0000100::numeric(21,8) as "numeric(21,8)",
+...        1.0000100::number(21,8) as "number(21,8)"
+... union all
+... select '1.0000' as input,
+...        1.0000::numeric(21,8) as "numeric(21,8)",
+...        1.0000::number(21,8) as "number(21,8)"
+... union all
+... select '1' as input,
+...        1::numeric(21,8) as "numeric(21,8)",
+...        1::number(21,8) as "number(21,8)"
+... union all
+... select '1234567890123' as input,
+...        1234567890123::numeric(21,8) as "numeric(21,8)",
+...        1234567890123::number(21,8) as "number(21,8)"
+... union all
+... select '1234567890123.12345678' as input,
+...        1234567890123.12345678::numeric(21,8) as "numeric(21,8)",
+...        1234567890123.12345678::number(21,8) as "number(21,8)"
+... union all
+... select '1.00001' as input,
+...        1.00001::numeric(21,8) as "numeric(21,8)",
+...        1.00001::number(21,8) as "number(21,8)"''')
+>>> print(t.Pretty())
++------------------------+------------------------+------------------------+
+| input                  | numeric(21,8)          | number(21,8)           |
++------------------------+------------------------+------------------------+
+| 1.000001000000000      | 1.00000100             | 1.000001               |
+| 1.0000100              | 1.00001000             | 1.00001                |
+| 1.0000                 | 1.00000000             | 1                      |
+| 1                      | 1.00000000             | 1                      |
+| 1234567890123          | 1234567890123.00000000 | 1234567890123          |
+| 1234567890123.12345678 | 1234567890123.12345678 | 1234567890123.12345678 |
+| 1.00001                | 1.00001000             | 1.00001                |
++------------------------+------------------------+------------------------+
+>>> t.Rows[0]['numeric(21,8)']
+Decimal('1.00000100')
+>>> t.Rows[0]['number(21,8)']
+Decimal('1.000001')
+
+
+# 5) Installing pg_numbertype
+
+To install it, you need PostgreSQL server development header files, usually
+present in postgresql-server-dev-X.Y packages (being X.Y the PostgreSQL version
+you are using), depending on the Linux distribution you use:
+
+Debian: sudo apt install postgresql-server-dev-X.Y
+CentOS: sudo yum install postgresqlXY-devel
+
+Then you will need to compile it and install it:
+
+make
+sudo make install
+
+Now you need to include it in the PostgreSQL shared_preload_libraries setting
+in postgresql.conf (requires a PostgreSQL restart).
+
+shared_preload_libraries = 'pg_numbertype'
+
+Finally, you can load the data type inside PostgreSQL this way (as a superuser):
+
+CREATE EXTENSION pg_numbertype;
