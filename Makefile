@@ -1,3 +1,13 @@
+#-------------------------------------------------------------------------
+#
+# pg_numbertype
+#    A simple NUMBER implementation for demonstration purposes.
+#
+# Copyright (c) 2025, William Ivanski
+#
+#-------------------------------------------------------------------------
+
+
 EXTENSION = pg_numbertype
 DATA = pg_numbertype--0.0.1.sql
 MODULES = pg_numbertype

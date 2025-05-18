@@ -1,361 +1,454 @@
-#include "postgres.h"
+/*-------------------------------------------------------------------------
+ *
+ * pg_numbertype
+ *	  A simple NUMBER implementation for demonstration purposes.
+ *
+ * Copyright (c) 2025, William Ivanski
+ *
+ *-------------------------------------------------------------------------
+ */
 
-#include <ctype.h>
-#include <float.h>
-#include <limits.h>
+
+#include "postgres.h"
+#include "fmgr.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
-#include "access/hash.h"
-#include "catalog/pg_type.h"
-#include "funcapi.h"
-#include "lib/hyperloglog.h"
-#include "libpq/pqformat.h"
-#include "miscadmin.h"
-#include "nodes/nodeFuncs.h"
-#include "utils/array.h"
-#include "utils/builtins.h"
-#include "utils/guc.h"
-#include "utils/int8.h"
-#include "utils/numeric.h"
-#include "utils/sortsupport.h"
 
 
 PG_MODULE_MAGIC;
 
 
-#define NBASE		10000
-#define HALF_NBASE	5000
-#define DEC_DIGITS	4			/* decimal digits per NBASE digit */
-#define MUL_GUARD_DIGITS	2	/* these are measured in NBASE digits */
-#define DIV_GUARD_DIGITS	4
+/*
+ * Number -
+ *
+ *  Internal representation for number data type
+ */
+typedef struct Number {
+    double      x;
+} Number;
 
-typedef int16 NumericDigit;
 
-struct NumericShort
+/*
+ * number_in() -
+ *
+ *	Input function for number data type
+ */
+PG_FUNCTION_INFO_V1(number_in);
+Datum
+number_in(PG_FUNCTION_ARGS)
 {
-	uint16		n_header;		/* Sign + display scale + weight */
-	NumericDigit n_data[FLEXIBLE_ARRAY_MEMBER]; /* Digits */
-};
+	char	   *str = PG_GETARG_CSTRING(0);
+	double      x;
+	Number     *result;
 
-struct NumericLong
-{
-	uint16		n_sign_dscale;	/* Sign + display scale */
-	int16		n_weight;		/* Weight of 1st digit	*/
-	NumericDigit n_data[FLEXIBLE_ARRAY_MEMBER]; /* Digits */
-};
+	if (sscanf(str, "%lf", &x) != 1)
+		ereport(ERROR,
+			    (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+			     errmsg("invalid input syntax for type NUMBER: \"%s\"",
+			    	    str)));
 
-union NumericChoice
-{
-	uint16		n_header;		/* Header word */
-	struct NumericLong n_long;	/* Long form (4-byte header) */
-	struct NumericShort n_short;	/* Short form (2-byte header) */
-};
+    result = (Number *) palloc(sizeof(Number));
 
-struct NumericData
-{
-	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	union NumericChoice choice; /* choice of format */
-};
+    result->x = x;
 
-#define NUMERIC_SIGN_MASK	0xC000
-#define NUMERIC_POS			0x0000
-#define NUMERIC_NEG			0x4000
-#define NUMERIC_SHORT		0x8000
-#define NUMERIC_NAN			0xC000
-
-#define NUMERIC_FLAGBITS(n) ((n)->choice.n_header & NUMERIC_SIGN_MASK)
-#define NUMERIC_IS_NAN(n)		(NUMERIC_FLAGBITS(n) == NUMERIC_NAN)
-#define NUMERIC_IS_SHORT(n)		(NUMERIC_FLAGBITS(n) == NUMERIC_SHORT)
-
-#define NUMERIC_HDRSZ	(VARHDRSZ + sizeof(uint16) + sizeof(int16))
-#define NUMERIC_HDRSZ_SHORT (VARHDRSZ + sizeof(uint16))
-
-#define NUMERIC_HEADER_IS_SHORT(n)	(((n)->choice.n_header & 0x8000) != 0)
-#define NUMERIC_HEADER_SIZE(n) \
-	(VARHDRSZ + sizeof(uint16) + \
-	 (NUMERIC_HEADER_IS_SHORT(n) ? 0 : sizeof(int16)))
-
-#define NUMERIC_SHORT_SIGN_MASK			0x2000
-#define NUMERIC_SHORT_DSCALE_MASK		0x1F80
-#define NUMERIC_SHORT_DSCALE_SHIFT		7
-#define NUMERIC_SHORT_DSCALE_MAX		\
-	(NUMERIC_SHORT_DSCALE_MASK >> NUMERIC_SHORT_DSCALE_SHIFT)
-#define NUMERIC_SHORT_WEIGHT_SIGN_MASK	0x0040
-#define NUMERIC_SHORT_WEIGHT_MASK		0x003F
-#define NUMERIC_SHORT_WEIGHT_MAX		NUMERIC_SHORT_WEIGHT_MASK
-#define NUMERIC_SHORT_WEIGHT_MIN		(-(NUMERIC_SHORT_WEIGHT_MASK+1))
-
-#define NUMERIC_DSCALE_MASK			0x3FFF
-
-#define NUMERIC_SIGN(n) \
-	(NUMERIC_IS_SHORT(n) ? \
-		(((n)->choice.n_short.n_header & NUMERIC_SHORT_SIGN_MASK) ? \
-		NUMERIC_NEG : NUMERIC_POS) : NUMERIC_FLAGBITS(n))
-#define NUMERIC_DSCALE(n)	(NUMERIC_HEADER_IS_SHORT((n)) ? \
-	((n)->choice.n_short.n_header & NUMERIC_SHORT_DSCALE_MASK) \
-		>> NUMERIC_SHORT_DSCALE_SHIFT \
-	: ((n)->choice.n_long.n_sign_dscale & NUMERIC_DSCALE_MASK))
-#define NUMERIC_WEIGHT(n)	(NUMERIC_HEADER_IS_SHORT((n)) ? \
-	(((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ? \
-		~NUMERIC_SHORT_WEIGHT_MASK : 0) \
-	 | ((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_MASK)) \
-	: ((n)->choice.n_long.n_weight))
-
-typedef struct NumericVar
-{
-	int			ndigits;		/* # of digits in digits[] - can be 0! */
-	int			weight;			/* weight of first digit */
-	int			sign;			/* NUMERIC_POS, NUMERIC_NEG, or NUMERIC_NAN */
-	int			dscale;			/* display scale */
-	NumericDigit *buf;			/* start of palloc'd space for digits[] */
-	NumericDigit *digits;		/* base-NBASE digits */
-} NumericVar;
-
-typedef struct
-{
-	NumericVar	current;
-	NumericVar	stop;
-	NumericVar	step;
-} generate_series_numeric_fctx;
-
-typedef struct
-{
-	void	   *buf;			/* buffer for short varlenas */
-	int64		input_count;	/* number of non-null values seen */
-	bool		estimating;		/* true if estimating cardinality */
-
-	hyperLogLogState abbr_card; /* cardinality estimator */
-} NumericSortSupport;
-
-#define NUMERIC_ABBREV_BITS (SIZEOF_DATUM * BITS_PER_BYTE)
-#if SIZEOF_DATUM == 8
-#define NumericAbbrevGetDatum(X) ((Datum) SET_8_BYTES(X))
-#define DatumGetNumericAbbrev(X) ((int64) GET_8_BYTES(X))
-#define NUMERIC_ABBREV_NAN		 NumericAbbrevGetDatum(PG_INT64_MIN)
-#else
-#define NumericAbbrevGetDatum(X) ((Datum) SET_4_BYTES(X))
-#define DatumGetNumericAbbrev(X) ((int32) GET_4_BYTES(X))
-#define NUMERIC_ABBREV_NAN		 NumericAbbrevGetDatum(PG_INT32_MIN)
-#endif
-
-#define NUMERIC_DIGITS(num) (NUMERIC_HEADER_IS_SHORT(num) ? \
-	(num)->choice.n_short.n_data : (num)->choice.n_long.n_data)
-#define NUMERIC_NDIGITS(num) \
-	((VARSIZE(num) - NUMERIC_HEADER_SIZE(num)) / sizeof(NumericDigit))
-#define NUMERIC_CAN_BE_SHORT(scale,weight) \
-	((scale) <= NUMERIC_SHORT_DSCALE_MAX && \
-	(weight) <= NUMERIC_SHORT_WEIGHT_MAX && \
-	(weight) >= NUMERIC_SHORT_WEIGHT_MIN)
+    PG_RETURN_POINTER(result);
+}
 
 
-static void init_var_from_num(Numeric num, NumericVar *dest);
-static char *get_str_from_var(NumericVar *var);
-
-
+/*
+ * number_out() -
+ *
+ *	Output function for number data type
+ */
 PG_FUNCTION_INFO_V1(number_out);
 Datum
 number_out(PG_FUNCTION_ARGS)
 {
-	Numeric		num = PG_GETARG_NUMERIC(0);
-	NumericVar	x;
-	char	   *str;
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+    char       *result;
+    int         last;
+    
+    result = psprintf("%.8lf", num->x);
 
-	/*
-	 * Handle NaN
-	 */
-	if (NUMERIC_IS_NAN(num))
-		PG_RETURN_CSTRING(pstrdup("NaN"));
+    /* If there's no decimal point, there's certainly nothing to remove. */
+	if (strchr(result, '.') != NULL)
+	{
+		/*
+		 * Back up over trailing fractional zeroes.  Since there is a decimal
+		 * point, this loop will terminate safely.
+		 */
+		last = strlen(result) - 1;
+		while (result[last] == '0')
+			last--;
 
-	/*
-	 * Get the number in the variable format.
-	 */
-	init_var_from_num(num, &x);
+		/* We want to get rid of the decimal point too, if it's now last. */
+		if (result[last] == '.')
+			last--;
 
-	str = get_str_from_var(&x);
+		/* Delete whatever we backed up over. */
+		result[last + 1] = '\0';
+	}
 
-	PG_RETURN_CSTRING(str);
+    PG_RETURN_CSTRING(result);
 }
 
 
-static void
-init_var_from_num(Numeric num, NumericVar *dest)
+/*
+ * number_smallint() -
+ *
+ *	Converts from number to smallint
+ */
+PG_FUNCTION_INFO_V1(number_smallint);
+Datum
+number_smallint(PG_FUNCTION_ARGS)
 {
-	dest->ndigits = NUMERIC_NDIGITS(num);
-	dest->weight = NUMERIC_WEIGHT(num);
-	dest->sign = NUMERIC_SIGN(num);
-	dest->dscale = NUMERIC_DSCALE(num);
-	dest->digits = NUMERIC_DIGITS(num);
-	dest->buf = NULL;			/* digits array is not palloc'd */
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	int16      result;
+
+	result = (int16) round(num->x);
+
+    PG_RETURN_INT16(result);
 }
 
 
-static char *
-get_str_from_var(NumericVar *var)
+/*
+ * number_integer() -
+ *
+ *	Converts from number to integer
+ */
+PG_FUNCTION_INFO_V1(number_integer);
+Datum
+number_integer(PG_FUNCTION_ARGS)
 {
-	int			dscale, tscale;
-	char	   *str;
-	char	   *cp;
-	char	   *endcp;
-	int			i;
-	int			d, t;
-	NumericDigit dig;
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	int32      result;
 
-#if DEC_DIGITS > 1
-	NumericDigit d1;
-#endif
+	result = (int32) round(num->x);
 
-	dscale = var->dscale;
+    PG_RETURN_INT32(result);
+}
 
-	/*
-	 * Allocate space for the result.
-	 *
-	 * i is set to the # of decimal digits before decimal point. dscale is the
-	 * # of decimal digits we will print after decimal point. We may generate
-	 * as many as DEC_DIGITS-1 excess digits at the end, and in addition we
-	 * need room for sign, decimal point, null terminator.
-	 */
-	i = (var->weight + 1) * DEC_DIGITS;
-	if (i <= 0)
-		i = 1;
 
-	str = palloc(i + dscale + DEC_DIGITS + 2);
-	cp = str;
+/*
+ * number_bigint() -
+ *
+ *	Converts from number to bigint
+ */
+PG_FUNCTION_INFO_V1(number_bigint);
+Datum
+number_bigint(PG_FUNCTION_ARGS)
+{
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	int64      result;
 
-	/*
-	 * Output a dash for negative values
-	 */
-	if (var->sign == NUMERIC_NEG)
-		*cp++ = '-';
+	result = (int64) round(num->x);
 
-	/*
-	 * Output all digits before the decimal point
-	 */
-	if (var->weight < 0)
-	{
-		d = var->weight + 1;
-		*cp++ = '0';
-	}
-	else
-	{
-		for (d = 0; d <= var->weight; d++)
-		{
-			dig = (d < var->ndigits) ? var->digits[d] : 0;
-			/* In the first digit, suppress extra leading decimal zeroes */
-#if DEC_DIGITS == 4
-			{
-				bool		putit = (d > 0);
+    PG_RETURN_INT64(result);
+}
 
-				d1 = dig / 1000;
-				dig -= d1 * 1000;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				d1 = dig / 100;
-				dig -= d1 * 100;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				d1 = dig / 10;
-				dig -= d1 * 10;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				*cp++ = dig + '0';
-			}
-#elif DEC_DIGITS == 2
-			d1 = dig / 10;
-			dig -= d1 * 10;
-			if (d1 > 0 || d > 0)
-				*cp++ = d1 + '0';
-			*cp++ = dig + '0';
-#elif DEC_DIGITS == 1
-			*cp++ = dig + '0';
-#else
-#error unsupported NBASE
-#endif
-		}
-	}
 
-	/*
-	 * If requested, output a decimal point and all the digits that follow it.
-	 * We initially put out a multiple of DEC_DIGITS digits, then truncate if
-	 * needed.
-	 */
-	if (dscale > 0)
-	{
-        // Recalculating scale
-        tscale = 0;
-        t = d;
-        for (i = 0; i < dscale; t++, i += DEC_DIGITS)
-        {
-            dig = (t >= 0 && t < var->ndigits) ? var->digits[t] : 0;
-#if DEC_DIGITS == 4
-			d1 = dig / 1000;
-			dig -= d1 * 1000;
-			if (d1 > 0)
-                tscale = i + 1;
-			d1 = dig / 100;
-			dig -= d1 * 100;
-            if (d1 > 0)
-                tscale = i + 2;
-			d1 = dig / 10;
-			dig -= d1 * 10;
-            if (d1 > 0)
-                tscale = i + 3;
-            if (dig > 0)
-                tscale = i + 4;
-#elif DEC_DIGITS == 2
-			d1 = dig / 10;
-			dig -= d1 * 10;
-            if (d1 > 0)
-                tscale = i + 1;
-            if (dig > 0)
-                tscale = i + 2;
-#elif DEC_DIGITS == 1
-            if (dig > 0)
-                tscale = i + 1;
-#else
-#error unsupported NBASE
-#endif
-        }
-        dscale = tscale;
+/*
+ * number_abs() -
+ *
+ *	Absolute operator (@) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_abs);
+Datum
+number_abs(PG_FUNCTION_ARGS)
+{
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
 
-        if (dscale > 0)
-        {
-    		*cp++ = '.';
-    		endcp = cp + dscale;
-    		for (i = 0; i < dscale; d++, i += DEC_DIGITS)
-    		{
-                dig = (d >= 0 && d < var->ndigits) ? var->digits[d] : 0;
-#if DEC_DIGITS == 4
-    			d1 = dig / 1000;
-    			dig -= d1 * 1000;
-    			*cp++ = d1 + '0';
-    			d1 = dig / 100;
-    			dig -= d1 * 100;
-    			*cp++ = d1 + '0';
-    			d1 = dig / 10;
-    			dig -= d1 * 10;
-    			*cp++ = d1 + '0';
-    			*cp++ = dig + '0';
-#elif DEC_DIGITS == 2
-    			d1 = dig / 10;
-    			dig -= d1 * 10;
-    			*cp++ = d1 + '0';
-    			*cp++ = dig + '0';
-#elif DEC_DIGITS == 1
-    			*cp++ = dig + '0';
-#else
-#error unsupported NBASE
-#endif
-    		}
-    		cp = endcp;
-        }
-	}
+	if (num->x >= 0.0)
+    	result->x = num->x;
+   	else
+   		result->x = -1.0 * num->x;
 
-	/*
-	 * terminate the string and return it
-	 */
-	*cp = '\0';
-	return str;
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_uminus() -
+ *
+ *	Unary minus operator (-) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_uminus);
+Datum
+number_uminus(PG_FUNCTION_ARGS)
+{
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = -1.0 * num->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_uplus() -
+ *
+ *	Unary plus operator (+) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_uplus);
+Datum
+number_uplus(PG_FUNCTION_ARGS)
+{
+	Number     *num = (Number *) PG_GETARG_POINTER(0);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = num->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_add() -
+ *
+ *	Addition operator (+) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_add);
+Datum
+number_add(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = num1->x + num2->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_sub() -
+ *
+ *	Subtraction operator (-) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_sub);
+Datum
+number_sub(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = num1->x - num2->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_mul() -
+ *
+ *	Multiplication operator (*) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_mul);
+Datum
+number_mul(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = num1->x * num2->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_div() -
+ *
+ *	Division operator (/) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_div);
+Datum
+number_div(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = num1->x / num2->x;
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_mod() -
+ *
+ *	Modulo operator (%) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_mod);
+Datum
+number_mod(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = fmod(num1->x, num2->x);
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_power() -
+ *
+ *	Power operator (^) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_power);
+Datum
+number_power(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	Number     *result;
+	
+	result = (Number *) palloc(sizeof(Number));
+
+	result->x = pow(num1->x, num2->x);
+
+    PG_RETURN_POINTER(result);
+}
+
+
+/*
+ * number_eq() -
+ *
+ *	Equal operator (=) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_eq);
+Datum
+number_eq(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x == num2->x;
+	
+	PG_RETURN_BOOL(result);
+}
+
+
+/*
+ * number_ne() -
+ *
+ *	Not equal operator (<>) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_ne);
+Datum
+number_ne(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x != num2->x;
+	
+	PG_RETURN_BOOL(result);
+}
+
+
+/*
+ * number_gt() -
+ *
+ *	Greater than operator (>) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_gt);
+Datum
+number_gt(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x > num2->x;
+	
+	PG_RETURN_BOOL(result);
+}
+
+
+/*
+ * number_lt() -
+ *
+ *	Lesser than operator (<) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_lt);
+Datum
+number_lt(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x < num2->x;
+	
+	PG_RETURN_BOOL(result);
+}
+
+
+/*
+ * number_ge() -
+ *
+ *	Greater than or equal operator (>=) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_ge);
+Datum
+number_ge(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x >= num2->x;
+	
+	PG_RETURN_BOOL(result);
+}
+
+
+/*
+ * number_le() -
+ *
+ *	Lesser than or equal operator (<=) for number data type
+ */
+PG_FUNCTION_INFO_V1(number_le);
+Datum
+number_le(PG_FUNCTION_ARGS)
+{
+	Number     *num1 = (Number *) PG_GETARG_POINTER(0);
+	Number     *num2 = (Number *) PG_GETARG_POINTER(1);
+	bool       result;
+
+	result = num1->x <= num2->x;
+	
+	PG_RETURN_BOOL(result);
 }
